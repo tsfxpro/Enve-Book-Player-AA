@@ -17,6 +17,7 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSourceBitmapLoader
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
@@ -56,6 +57,7 @@ import dagger.hilt.InstallIn
 import dagger.hilt.android.EntryPointAccessors
 import dagger.hilt.components.SingletonComponent
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -85,6 +87,8 @@ class PlaybackService : MediaLibraryService() {
     private var profileCoordinator: ProfileSwitchCoordinator? = null
     private var profileLifecycleRegistration: AutoCloseable? = null
     private var closedForProfileSwitch = false
+    private val runtimeReady = CompletableDeferred<Unit>()
+    private var httpDataSourceFactory: DataSource.Factory? = null
     private var mediaSession: MediaLibrarySession? = null
     private var audioEffectsManager: AudioEffectsManager? = null
     private var localPlayer: ExoPlayer? = null
@@ -160,6 +164,7 @@ class PlaybackService : MediaLibraryService() {
         val device = EntryPointAccessors.fromApplication(applicationContext, PlaybackServiceEntryPoint::class.java)
         val coordinator = device.profileCoordinator()
         profileCoordinator = coordinator
+        createSession()
         val runtime = coordinator.activeRuntime.value
         if (runtime != null) {
             initializeSession(runtime, device)
@@ -167,45 +172,14 @@ class PlaybackService : MediaLibraryService() {
             initializationScope.launch {
                 coordinator.initialize()
                 val initialized = coordinator.activeRuntime.value
-                if (initialized == null) stopSelf() else initializeSession(initialized, device)
+                if (initialized == null) abandonInitialization() else initializeSession(initialized, device)
             }
         }
     }
 
-    private fun initializeSession(runtime: ActiveProfileRuntime, device: PlaybackServiceEntryPoint) {
-        val coordinator = checkNotNull(profileCoordinator)
-        if (coordinator.state.value.locked || coordinator.state.value.switching || coordinator.activeRuntime.value !== runtime) {
-            stopSelf()
-            return
-        }
-        capturedRuntime = runtime
-        val entryPoint = runtime.component
-        profileLifecycleRegistration = device.profileLifecycle().register(runtime.profileId) {
-            checkpointForProfileSwitch()
-        }
-
-        val dataSourceFactory = entryPoint.let { entry ->
-            val playbackClient = entry.httpClient().newBuilder()
-                .addInterceptor { chain ->
-                    val request = chain.request()
-                    val url = request.url
-                    if (url.username.isNotBlank() && url.password.isNotBlank()) {
-                        chain.proceed(
-                            request.newBuilder()
-                                .header("Authorization", Credentials.basic(url.username, url.password))
-                                .build()
-                        )
-                    } else {
-                        chain.proceed(request)
-                    }
-                }
-                .build()
-            val userAgent = "Enve/1.0 (Android; SDK ${android.os.Build.VERSION.SDK_INT})"
-            val authenticatedFactory = OkHttpDataSource.Factory(playbackClient).setUserAgent(userAgent)
-            val publicFactory = OkHttpDataSource.Factory(entry.unauthenticatedHttpClient()).setUserAgent(userAgent)
-            DefaultDataSource.Factory(this) {
-                PublicStreamRoutingDataSource(authenticatedFactory.createDataSource(), publicFactory.createDataSource())
-            }
+    private fun createSession() {
+        val dataSourceFactory = DefaultDataSource.Factory(this) {
+            checkNotNull(httpDataSourceFactory).createDataSource()
         }
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
@@ -225,39 +199,10 @@ class PlaybackService : MediaLibraryService() {
         exoPlayer.addListener(progressCheckpointListener(exoPlayer))
         localPlayer = exoPlayer
 
-        val sharedCastContext = runCatching { CastContext.getSharedInstance(this) }.getOrNull()
-        castContext = sharedCastContext
-        val cast = sharedCastContext?.let {
-            runCatching {
-                RemoteCastPlayer.Builder(this)
-                    .setMediaItemConverter(EnveMediaItemConverter())
-                    .setSeekBackIncrementMs(30_000)
-                    .setSeekForwardIncrementMs(30_000)
-                    .build()
-            }.getOrNull()
-        }
-        castPlayer = cast
-        cast?.addListener(progressCheckpointListener(cast))
-
-        chapterStore = entryPoint.chapterStore()
-        audioPlaybackManager = entryPoint.audioPlayback()
-        autoBrowserHelper = entryPoint.autoBrowserHelper()
-        castStreamResolver = entryPoint.castStreamResolver()
-        localCastServer = entryPoint.localCastServer()
-        progressService = entryPoint.progressService()
-        preferences = entryPoint.preferences()
-        playerSessionService = entryPoint.sessions()
-        playerSessionFacade = entryPoint.playerSession()
-        lastOpenedBookStore = entryPoint.lastOpenedBookStore()
-        playbackQueueCoordinator = entryPoint.playbackQueue()
-        readAloudPlayback = entryPoint.readAloud()
-        readAloudCheckpoints = entryPoint.readAloudCheckpoints()
-
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main).also { serviceScope = it }
-        val initialPlayer: Player = if (cast != null && cast.isCastSessionAvailable) cast else exoPlayer
         val sessionBuilder = MediaLibrarySession.Builder(
             this,
-            NoSkipTrackPlayer(initialPlayer),
+            NoSkipTrackPlayer(exoPlayer),
             LibraryCallback(scope),
         ).setMediaButtonPreferences(autoMediaButtonPreferences())
         packageManager.getLaunchIntentForPackage(packageName)?.let { launchIntent ->
@@ -289,6 +234,83 @@ class PlaybackService : MediaLibraryService() {
                 .apply { setSmallIcon(R.drawable.ic_notification) }
         )
         setShowNotificationForIdlePlayer(SHOW_NOTIFICATION_FOR_IDLE_PLAYER_NEVER)
+    }
+
+    private fun abandonInitialization() {
+        runtimeReady.completeExceptionally(IllegalStateException("No active profile runtime"))
+        mediaSession?.release()
+        mediaSession = null
+        stopSelf()
+    }
+
+    private fun initializeSession(runtime: ActiveProfileRuntime, device: PlaybackServiceEntryPoint) {
+        val coordinator = checkNotNull(profileCoordinator)
+        if (coordinator.state.value.locked || coordinator.state.value.switching || coordinator.activeRuntime.value !== runtime) {
+            abandonInitialization()
+            return
+        }
+        capturedRuntime = runtime
+        val entryPoint = runtime.component
+        profileLifecycleRegistration = device.profileLifecycle().register(runtime.profileId) {
+            checkpointForProfileSwitch()
+        }
+
+        httpDataSourceFactory = entryPoint.let { entry ->
+            val playbackClient = entry.httpClient().newBuilder()
+                .addInterceptor { chain ->
+                    val request = chain.request()
+                    val url = request.url
+                    if (url.username.isNotBlank() && url.password.isNotBlank()) {
+                        chain.proceed(
+                            request.newBuilder()
+                                .header("Authorization", Credentials.basic(url.username, url.password))
+                                .build()
+                        )
+                    } else {
+                        chain.proceed(request)
+                    }
+                }
+                .build()
+            val userAgent = "Enve/1.0 (Android; SDK ${android.os.Build.VERSION.SDK_INT})"
+            val authenticatedFactory = OkHttpDataSource.Factory(playbackClient).setUserAgent(userAgent)
+            val publicFactory = OkHttpDataSource.Factory(entry.unauthenticatedHttpClient()).setUserAgent(userAgent)
+            DataSource.Factory {
+                PublicStreamRoutingDataSource(authenticatedFactory.createDataSource(), publicFactory.createDataSource())
+            }
+        }
+        val exoPlayer = checkNotNull(localPlayer)
+
+        val sharedCastContext = runCatching { CastContext.getSharedInstance(this) }.getOrNull()
+        castContext = sharedCastContext
+        val cast = sharedCastContext?.let {
+            runCatching {
+                RemoteCastPlayer.Builder(this)
+                    .setMediaItemConverter(EnveMediaItemConverter())
+                    .setSeekBackIncrementMs(30_000)
+                    .setSeekForwardIncrementMs(30_000)
+                    .build()
+            }.getOrNull()
+        }
+        castPlayer = cast
+        cast?.addListener(progressCheckpointListener(cast))
+
+        chapterStore = entryPoint.chapterStore()
+        audioPlaybackManager = entryPoint.audioPlayback()
+        autoBrowserHelper = entryPoint.autoBrowserHelper()
+        castStreamResolver = entryPoint.castStreamResolver()
+        localCastServer = entryPoint.localCastServer()
+        progressService = entryPoint.progressService()
+        preferences = entryPoint.preferences()
+        playerSessionService = entryPoint.sessions()
+        playerSessionFacade = entryPoint.playerSession()
+        lastOpenedBookStore = entryPoint.lastOpenedBookStore()
+        playbackQueueCoordinator = entryPoint.playbackQueue()
+        readAloudPlayback = entryPoint.readAloud()
+        readAloudCheckpoints = entryPoint.readAloudCheckpoints()
+
+        if (cast != null && cast.isCastSessionAvailable) {
+            mediaSession?.setPlayer(NoSkipTrackPlayer(cast))
+        }
 
         startWatchingChapters()
         startWatchingProgress()
@@ -352,10 +374,11 @@ class PlaybackService : MediaLibraryService() {
                 effects.attachToSession(exoPlayer.audioSessionId)
             }
         }
+        runtimeReady.complete(Unit)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
-        if (!ownsActiveProfile()) return null
+        if (!runtimeReady.isActive && !ownsActiveProfile()) return null
         Log.i(
             "PlaybackService",
             "onGetSession pkg=${controllerInfo.packageName} uid=${controllerInfo.uid} trusted=${controllerInfo.isTrusted} sessionPresent=${mediaSession != null}",
@@ -1551,8 +1574,6 @@ class PlaybackService : MediaLibraryService() {
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<MediaItem>> {
             Log.i("PlaybackService", "onGetLibraryRoot pkg=${browser.packageName}")
-            val helper = autoBrowserHelper
-                ?: return Futures.immediateFuture(LibraryResult.ofError(SessionError.ERROR_NOT_SUPPORTED))
             val rootExtras = Bundle().apply {
                 putInt(
                     MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
@@ -1566,7 +1587,7 @@ class PlaybackService : MediaLibraryService() {
             val rootParams = LibraryParams.Builder()
                 .setExtras(rootExtras)
                 .build()
-            return Futures.immediateFuture(LibraryResult.ofItem(helper.buildRoot(), rootParams))
+            return Futures.immediateFuture(LibraryResult.ofItem(AutoMediaBrowserHelper.buildRoot(), rootParams))
         }
 
         override fun onGetChildren(
@@ -1578,10 +1599,8 @@ class PlaybackService : MediaLibraryService() {
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
             Log.i("PlaybackService", "onGetChildren pkg=${browser.packageName} parent=$parentId")
-            val helper = autoBrowserHelper
-                ?: return Futures.immediateFuture(LibraryResult.ofItemList(ImmutableList.of(), params))
             return launchToListenableFuture {
-                val items = AutoMediaBrowserHelper.paginate(helper.getChildren(parentId), page, pageSize)
+                val items = AutoMediaBrowserHelper.paginate(browserHelper.getChildren(parentId), page, pageSize)
                 Log.i("PlaybackService", "onGetChildren parent=$parentId page=$page returning ${items.size} items")
                 LibraryResult.ofItemList(ImmutableList.copyOf(items), params)
             }
@@ -1592,10 +1611,8 @@ class PlaybackService : MediaLibraryService() {
             browser: MediaSession.ControllerInfo,
             mediaId: String,
         ): ListenableFuture<LibraryResult<MediaItem>> {
-            val helper = autoBrowserHelper
-                ?: return Futures.immediateFuture(LibraryResult.ofError(SessionError.ERROR_NOT_SUPPORTED))
             return launchToListenableFuture {
-                val item = helper.getItem(mediaId)
+                val item = browserHelper.getItem(mediaId)
                 if (item == null) {
                     LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
                 } else {
@@ -1610,10 +1627,8 @@ class PlaybackService : MediaLibraryService() {
             query: String,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<Void>> {
-            val helper = autoBrowserHelper
-                ?: return Futures.immediateFuture(LibraryResult.ofError(SessionError.ERROR_NOT_SUPPORTED))
             return launchToListenableFuture {
-                val count = helper.audiobookSearchCount(query)
+                val count = browserHelper.audiobookSearchCount(query)
                 withContext(Dispatchers.Main.immediate) {
                     session.notifySearchResultChanged(browser, query, count, params)
                 }
@@ -1629,10 +1644,8 @@ class PlaybackService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
-            val helper = autoBrowserHelper
-                ?: return Futures.immediateFuture(LibraryResult.ofItemList(ImmutableList.of(), params))
             return launchToListenableFuture {
-                val items = helper.searchAudiobooks(query, page, pageSize)
+                val items = browserHelper.searchAudiobooks(query, page, pageSize)
                 LibraryResult.ofItemList(ImmutableList.copyOf(items), params)
             }
         }
@@ -1791,10 +1804,14 @@ class PlaybackService : MediaLibraryService() {
             return Resolved(out, firstStartIndex, firstStartMs, primary)
         }
 
+        private val browserHelper: AutoMediaBrowserHelper
+            get() = checkNotNull(autoBrowserHelper)
+
         private fun <T> launchToListenableFuture(block: suspend () -> T): ListenableFuture<T> {
             val future = SettableFuture.create<T>()
             scope.launch(Dispatchers.IO) {
                 try {
+                    runtimeReady.await()
                     future.set(block())
                 } catch (e: CancellationException) {
                     future.cancel(false)

@@ -77,6 +77,18 @@ class AutoMediaBrowserHelper @Inject constructor(
         fun isChapterMediaId(mediaId: String): Boolean =
             mediaId.startsWith(BOOK_PREFIX) && "#chapter:" in mediaId
 
+        fun buildRoot(): MediaItem = MediaItem.Builder()
+            .setMediaId(ROOT_ID)
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle("Enve")
+                    .setIsBrowsable(true)
+                    .setIsPlayable(false)
+                    .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_AUDIO_BOOKS)
+                    .build()
+            )
+            .build()
+
         fun <T> paginate(items: List<T>, page: Int, pageSize: Int): List<T> {
             if (page < 0 || pageSize <= 0) return emptyList()
             val from = page.toLong() * pageSize
@@ -130,18 +142,6 @@ class AutoMediaBrowserHelper @Inject constructor(
                 .coerceIn(0L, segment.endMs - segment.startMs)
         }
     }
-
-    fun buildRoot(): MediaItem = MediaItem.Builder()
-        .setMediaId(ROOT_ID)
-        .setMediaMetadata(
-            MediaMetadata.Builder()
-                .setTitle("Enve")
-                .setIsBrowsable(true)
-                .setIsPlayable(false)
-                .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_AUDIO_BOOKS)
-                .build()
-        )
-        .build()
 
     suspend fun getChildren(parentId: String): List<MediaItem> = withContext(Dispatchers.IO) {
         when (parentId) {
