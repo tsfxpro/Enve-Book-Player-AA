@@ -18,7 +18,7 @@ jobs:
   build:
     name: Compile Android
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: android
@@ -41,5 +41,18 @@ jobs:
       - name: Verify Android provenance
         run: ./scripts/verify-provenance
 
-      - name: Compile Android
-        run: ./gradlew --no-daemon :app:compileDebugKotlin
+      - name: Restore debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: enve-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
