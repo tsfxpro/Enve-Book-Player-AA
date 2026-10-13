@@ -69,6 +69,7 @@ class AudiobookshelfRepository @Inject constructor(
     private val progressWrites: com.enve.core.data.sync.AudiobookProgressWriteCoordinator,
     private val bookCache: com.enve.core.data.local.BookCacheDao,
     private val pendingProgress: com.enve.core.data.local.PendingProgressPushDao,
+    private val sharedRequests: AbsSharedRequests,
     private val locations: ProfileStorageLocations = ProfileStorageLocations.forProfile(context, DEFAULT_ADULT_PROFILE_ID),
     private val serverSync: com.enve.core.data.local.ProfileServerSyncStore = com.enve.core.data.local.ProfileServerSyncStore(context, locations),
 ) {
@@ -966,15 +967,17 @@ class AudiobookshelfRepository @Inject constructor(
         }
     }
 
+    private suspend fun fetchMe() = sharedRequests.me(scopedServerUrlAndToken()) { api.getMe() }
+
     suspend fun getMe(): Result<com.enve.audiobookshelf.dto.AbsMeResponse> = runSuspendCatching {
-        val resp = api.getMe()
+        val resp = fetchMe()
         if (!resp.isSuccessful) error("Audiobookshelf /api/me failed: HTTP ${resp.code()}")
         resp.body() ?: com.enve.audiobookshelf.dto.AbsMeResponse()
     }
 
     suspend fun getProgressForBooks(books: List<Book>): List<Book> {
         if (!serverSync.isEnabled) return books
-        val response = api.getMe()
+        val response = fetchMe()
         check(response.isSuccessful) { "ABS user progress failed: HTTP ${response.code()}" }
         val progress = checkNotNull(response.body()) { "ABS user progress returned an empty body" }
             .mediaProgress.filter { it.episodeId == null }
@@ -1015,14 +1018,23 @@ class AudiobookshelfRepository @Inject constructor(
 
     suspend fun getBooksInProgress(allowCachedFallback: Boolean = true): Result<List<Book>> {
         if (!serverSync.isEnabled) return Result.success(emptyList())
-        val result = runSuspendCatching {
+        val result = sharedRequests.booksInProgress(scopedServerUrlAndToken()) { fetchBooksInProgress() }
+        if (result.isSuccess || !allowCachedFallback) return result
+        val cached = runSuspendCatching {
+            loadLaneFromDisk(scopedServerUrlAndToken().first.trimEnd('/'), "in-progress")
+        }.getOrNull()
+        return cached?.let { Result.success(it) } ?: result
+    }
+
+    private suspend fun fetchBooksInProgress(): Result<List<Book>> =
+        runSuspendCatching {
             val normalizedUrl = scopedServerUrlAndToken().first.trimEnd('/')
 
             val itemsResponse = api.getItemsInProgress()
             check(itemsResponse.isSuccessful) { "ABS in-progress items failed: HTTP ${itemsResponse.code()}" }
             val items = checkNotNull(itemsResponse.body()?.items) { "ABS in-progress items returned an empty body" }
 
-            val meResponse = api.getMe()
+            val meResponse = fetchMe()
             check(meResponse.isSuccessful) { "ABS user progress failed: HTTP ${meResponse.code()}" }
             val progressEntries = checkNotNull(meResponse.body()?.mediaProgress) { "ABS user progress returned an empty body" }
 
@@ -1042,12 +1054,6 @@ class AudiobookshelfRepository @Inject constructor(
             saveLaneToDisk(normalizedUrl, "in-progress", books)
             books
         }
-        if (result.isSuccess || !allowCachedFallback) return result
-        val cached = runSuspendCatching {
-            loadLaneFromDisk(scopedServerUrlAndToken().first.trimEnd('/'), "in-progress")
-        }.getOrNull()
-        return cached?.let { Result.success(it) } ?: result
-    }
 
     suspend fun getContinueListening(): Result<List<Book>> =
         getBooksInProgress().map { books ->
