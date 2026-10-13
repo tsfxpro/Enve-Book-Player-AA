@@ -20,6 +20,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSourceBitmapLoader
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import com.enve.app.profiles.ProfileLifecycleRegistry
 import com.enve.app.profiles.ProfileSwitchCoordinator
@@ -276,12 +277,16 @@ class PlaybackService : MediaLibraryService() {
             val authenticatedFactory = OkHttpDataSource.Factory(playbackClient).setUserAgent(userAgent)
             val publicFactory = OkHttpDataSource.Factory(entry.unauthenticatedHttpClient()).setUserAgent(userAgent)
             val redirects = ConcurrentHashMap<Uri, Uri>()
-            DataSource.Factory {
+            val networkFactory = DataSource.Factory {
                 PublicStreamRoutingDataSource(
                     RedirectReusingDataSource(authenticatedFactory.createDataSource(), redirects),
                     RedirectReusingDataSource(publicFactory.createDataSource(), redirects),
                 )
             }
+            CacheDataSource.Factory()
+                .setCache(PlaybackStreamCache.forProfileCache(this, entry.resources().locations.cacheDirectory))
+                .setUpstreamDataSourceFactory(networkFactory)
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
         }
         val exoPlayer = checkNotNull(localPlayer)
 
