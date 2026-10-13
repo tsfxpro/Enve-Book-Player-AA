@@ -77,6 +77,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.Credentials
 import okhttp3.OkHttpClient
+import java.util.concurrent.ConcurrentHashMap
 
 @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
 @androidx.annotation.OptIn(UnstableApi::class)
@@ -274,8 +275,12 @@ class PlaybackService : MediaLibraryService() {
             val userAgent = "Enve/1.0 (Android; SDK ${android.os.Build.VERSION.SDK_INT})"
             val authenticatedFactory = OkHttpDataSource.Factory(playbackClient).setUserAgent(userAgent)
             val publicFactory = OkHttpDataSource.Factory(entry.unauthenticatedHttpClient()).setUserAgent(userAgent)
+            val redirects = ConcurrentHashMap<Uri, Uri>()
             DataSource.Factory {
-                PublicStreamRoutingDataSource(authenticatedFactory.createDataSource(), publicFactory.createDataSource())
+                PublicStreamRoutingDataSource(
+                    RedirectReusingDataSource(authenticatedFactory.createDataSource(), redirects),
+                    RedirectReusingDataSource(publicFactory.createDataSource(), redirects),
+                )
             }
         }
         val exoPlayer = checkNotNull(localPlayer)

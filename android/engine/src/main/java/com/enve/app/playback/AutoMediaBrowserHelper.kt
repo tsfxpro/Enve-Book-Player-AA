@@ -12,10 +12,12 @@ import androidx.media3.session.MediaConstants
 import com.enve.app.data.offline.OfflineDownloadManager
 import com.enve.app.data.repository.AggregatorRepository
 import com.enve.core.data.local.BookCacheDao
+import com.enve.core.data.local.BookExtras
 import com.enve.core.data.local.BookExtrasDao
 import com.enve.core.data.local.CachedBook
 import com.enve.core.data.local.LastOpenedBookStore
 import com.enve.core.data.local.decodeChapters
+import com.enve.core.data.local.encodeChaptersJson
 import com.enve.core.data.local.toBook
 import com.enve.core.data.model.AudioTrack
 import com.enve.core.data.model.Book
@@ -30,6 +32,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
@@ -48,6 +52,8 @@ class AutoMediaBrowserHelper @Inject constructor(
     private val embeddedChapterExtractor: EmbeddedChapterExtractor,
     private val openProgress: PlaybackOpenProgressResolver,
 ) {
+    private val embeddedChapterMutex = Mutex()
+    private val probedEmbeddedChapters = mutableMapOf<String, List<Chapter>>()
 
     companion object {
         const val ROOT_ID = "enve_root"
@@ -293,7 +299,7 @@ class AutoMediaBrowserHelper @Inject constructor(
         val offline = offlineTracks(book)
         if (offline.isNotEmpty()) {
             val chapters = book.chapters.takeIf { it.size > 1 }
-                ?: embeddedChapters(offline, book.duration)
+                ?: embeddedChapters(cached.cacheKey, offline, book.duration)
                 ?: book.chapters.ifEmpty { synthesizeChaptersFromTracks(offline, book.duration) }
             Log.i(TAG, "resolve: ${book.id} using ${offline.size} offline tracks resume=${localResumeMs}ms")
             return@withContext buildResolved(book, offline, localResumeMs, chapters, null)
@@ -307,16 +313,37 @@ class AutoMediaBrowserHelper @Inject constructor(
         val resumeMs = localResumeMs
         val chapters = remote.session?.chapters?.takeIf { it.isNotEmpty() }
             ?: book.chapters.takeIf { it.size > 1 }
-            ?: embeddedChapters(remote.tracks, book.duration)
+            ?: embeddedChapters(cached.cacheKey, remote.tracks, book.duration)
             ?: book.chapters.ifEmpty { synthesizeChaptersFromTracks(remote.tracks, book.duration) }
         Log.i(TAG, "resolve: ${book.id} using ${remote.tracks.size} provider tracks resume=${resumeMs}ms")
         buildResolved(book, remote.tracks, resumeMs, chapters, remote.session?.sessionId)
     }
 
-    private suspend fun embeddedChapters(tracks: List<AudioTrack>, durationSec: Long): List<Chapter>? =
-        tracks.singleOrNull()
-            ?.let { embeddedChapterExtractor.fetchEmbeddedChapters(listOf(it), durationSec) }
-            ?.takeIf { it.size > 1 }
+    private suspend fun embeddedChapters(
+        cacheKey: String,
+        tracks: List<AudioTrack>,
+        durationSec: Long,
+    ): List<Chapter>? {
+        val track = tracks.singleOrNull() ?: return null
+        val chapters = embeddedChapterMutex.withLock {
+            probedEmbeddedChapters.getOrPut(cacheKey) {
+                Log.i(TAG, "probing embedded chapters for $cacheKey")
+                embeddedChapterExtractor.fetchEmbeddedChapters(listOf(track), durationSec)
+                    .also { if (it.size > 1) storeChapters(cacheKey, it) }
+            }
+        }
+        return chapters.takeIf { it.size > 1 }
+    }
+
+    private suspend fun storeChapters(cacheKey: String, chapters: List<Chapter>) {
+        val extras = bookExtrasDao.get(cacheKey) ?: BookExtras(cacheKey = cacheKey)
+        bookExtrasDao.upsert(
+            extras.copy(
+                chaptersJson = encodeChaptersJson(chapters),
+                updatedAt = System.currentTimeMillis(),
+            ),
+        )
+    }
 
     private suspend fun buildResolved(
         book: Book,
